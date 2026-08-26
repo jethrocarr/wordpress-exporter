@@ -20,7 +20,7 @@ Example:
 
 Requirements:
 
-    pip install beautifulsoup4 requests html2text
+    pip install beautifulsoup4 requests html2text pillow
 
 And install Pandoc separately:
 
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import mimetypes
 import re
 import shutil
@@ -49,6 +50,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import html2text
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,7 @@ from bs4 import BeautifulSoup
 
 NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
+    "excerpt": "http://wordpress.org/export/1.2/excerpt/",
     "wp": "http://wordpress.org/export/1.2/",
     "dc": "http://purl.org/dc/elements/1.1/",
 }
@@ -76,6 +79,11 @@ IMAGE_MIME_EXTENSIONS = {
 
 IMAGE_EXTENSIONS = set(IMAGE_MIME_EXTENSIONS.values())
 
+# XeLaTeX cannot include these formats directly. Pandoc sometimes attempts its
+# own conversion, but that is backend/version dependent and can leave the
+# original file in the generated TeX after a conversion failure.
+LATEX_INCOMPATIBLE_IMAGE_EXTENSIONS = {".avif", ".webp"}
+
 
 @dataclass
 class Post:
@@ -86,6 +94,26 @@ class Post:
     categories: list[str]
     tags: list[str]
     link: str
+
+
+@dataclass
+class Attachment:
+    post_id: str
+    title: str
+    url: str
+    caption: str
+    date: datetime | None
+
+
+@dataclass
+class BlogExport:
+    title: str
+    description: str
+    link: str
+    author: str
+    channel_image: str | None
+    attachments: list[Attachment]
+    posts: list[Post]
 
 
 def slugify(value: str) -> str:
@@ -132,7 +160,93 @@ def image_stem_from_url(url: str) -> str:
     return stem or "image"
 
 
-def parse_wordpress_export(xml_path: Path) -> list[Post]:
+def strip_wordpress_caption_shortcodes(content_html: str) -> str:
+    # WordPress expands these when rendering a site, but a WXR export retains
+    # the literal shortcode wrapper around otherwise valid image HTML.
+    content_html = re.sub(
+        r"\[caption\b[^\]]*\]",
+        "",
+        content_html,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\[/caption\]",
+        "",
+        content_html,
+        flags=re.IGNORECASE,
+    )
+
+
+def expand_wordpress_galleries(
+    content_html: str,
+    attachments_by_id: dict[str, Attachment],
+) -> str:
+    def replace_gallery(match: re.Match) -> str:
+        attributes = match.group("attributes")
+        ids_match = re.search(
+            r"\bids\s*=\s*(?:\"([^\"]*)\"|“([^”]*)”|'([^']*)'|([^\s\]]+))",
+            attributes,
+            flags=re.IGNORECASE,
+        )
+
+        if ids_match is None:
+            print(
+                f"Warning: skipping gallery without attachment IDs: {match.group(0)}",
+                file=sys.stderr,
+            )
+            return ""
+
+        ids_value = next(
+            (value for value in ids_match.groups() if value is not None),
+            "",
+        )
+        parts = ['<div class="wordpress-gallery">']
+
+        for attachment_id in ids_value.split(","):
+            attachment_id = attachment_id.strip()
+
+            if not attachment_id:
+                continue
+
+            attachment = attachments_by_id.get(attachment_id)
+
+            if attachment is None:
+                print(
+                    f"Warning: gallery attachment {attachment_id} was not "
+                    "found in the WXR export.",
+                    file=sys.stderr,
+                )
+                continue
+
+            caption = BeautifulSoup(
+                attachment.caption,
+                "html.parser",
+            ).get_text(" ", strip=True)
+            parts.append('<figure class="wordpress-gallery-item">')
+            parts.append(
+                f'<img src="{html.escape(attachment.url, quote=True)}" '
+                f'alt="{html.escape(attachment.title, quote=True)}" />'
+            )
+
+            if caption:
+                parts.append(
+                    f"<figcaption>{html.escape(caption)}</figcaption>"
+                )
+
+            parts.append("</figure>")
+
+        parts.append("</div>")
+        return "\n".join(parts)
+
+    return re.sub(
+        r"\[gallery\b(?P<attributes>[^\]]*)\]",
+        replace_gallery,
+        content_html,
+        flags=re.IGNORECASE,
+    )
+
+
+def parse_wordpress_export(xml_path: Path) -> BlogExport:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -142,10 +256,49 @@ def parse_wordpress_export(xml_path: Path) -> list[Post]:
         raise RuntimeError("Could not find <channel> in WordPress export.")
 
     posts: list[Post] = []
+    attachments: list[Attachment] = []
 
     for item in channel.findall("item"):
         post_type = item.findtext("wp:post_type", namespaces=NS)
         status = item.findtext("wp:status", namespaces=NS)
+
+        if post_type == "attachment":
+            attachment_url = item.findtext(
+                "wp:attachment_url",
+                namespaces=NS,
+            )
+
+            if attachment_url:
+                attachment_date = None
+                date_string = item.findtext(
+                    "wp:post_date",
+                    namespaces=NS,
+                )
+
+                if date_string and not date_string.startswith("0000-00-00"):
+                    try:
+                        attachment_date = datetime.strptime(
+                            date_string,
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                    except ValueError:
+                        pass
+
+                attachments.append(
+                    Attachment(
+                        post_id=(
+                            item.findtext("wp:post_id", namespaces=NS) or ""
+                        ).strip(),
+                        title=(item.findtext("title") or "").strip(),
+                        url=attachment_url.strip(),
+                        caption=(
+                            item.findtext("excerpt:encoded", namespaces=NS) or ""
+                        ).strip(),
+                        date=attachment_date,
+                    )
+                )
+
+            continue
 
         # Only include published blog posts.
         if post_type != "post":
@@ -214,7 +367,26 @@ def parse_wordpress_export(xml_path: Path) -> list[Post]:
 
     posts.sort(key=lambda p: p.date)
 
-    return posts
+    author = ""
+    author_element = channel.find("wp:author", NS)
+
+    if author_element is not None:
+        author = (
+            author_element.findtext("wp:author_display_name", namespaces=NS)
+            or ""
+        ).strip()
+
+    channel_image = channel.findtext("image/url")
+
+    return BlogExport(
+        title=(channel.findtext("title") or "WordPress Blog Archive").strip(),
+        description=(channel.findtext("description") or "").strip(),
+        link=(channel.findtext("link") or "").strip(),
+        author=author,
+        channel_image=channel_image.strip() if channel_image else None,
+        attachments=attachments,
+        posts=posts,
+    )
 
 
 class ImageDownloader:
@@ -229,6 +401,37 @@ class ImageDownloader:
 
         self.cache: dict[str, Path] = {}
 
+    def make_latex_compatible(self, path: Path) -> Path | None:
+        if path.suffix.lower() not in LATEX_INCOMPATIBLE_IMAGE_EXTENSIONS:
+            return path
+
+        converted_path = path.with_suffix(".png")
+
+        if converted_path.exists():
+            return converted_path
+
+        try:
+            with Image.open(path) as image:
+                # Animated images cannot be represented in a PDF; use their
+                # first frame. Preserve transparency where the source has it.
+                image.seek(0)
+                image = ImageOps.exif_transpose(image)
+                has_transparency = (
+                    image.mode in {"RGBA", "LA"}
+                    or "transparency" in image.info
+                )
+                image = image.convert("RGBA" if has_transparency else "RGB")
+                image.save(converted_path, format="PNG", optimize=True)
+        except (OSError, ValueError) as exc:
+            print(
+                f"Warning: couldn't convert image {path} to PNG: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+        print(f"Converted for PDF: {path.name} -> {converted_path.name}")
+        return converted_path
+
     def download(self, url: str) -> Path | None:
         if url in self.cache:
             return self.cache[url]
@@ -239,9 +442,14 @@ class ImageDownloader:
             existing_path = self.image_dir / f"{stem}{extension}"
 
             if existing_path.exists():
-                self.cache[url] = existing_path
+                compatible_path = self.make_latex_compatible(existing_path)
+
+                if compatible_path is None:
+                    return None
+
+                self.cache[url] = compatible_path
                 print(f"Already downloaded: {url}")
-                return existing_path
+                return compatible_path
 
         try:
             response = self.session.get(
@@ -292,11 +500,16 @@ class ImageDownloader:
         finally:
             response.close()
 
-        self.cache[url] = path
+        compatible_path = self.make_latex_compatible(path)
+
+        if compatible_path is None:
+            return None
+
+        self.cache[url] = compatible_path
 
         print(f"Downloaded: {url}")
 
-        return path
+        return compatible_path
 
 
 def clean_and_localise_html(
@@ -304,7 +517,13 @@ def clean_and_localise_html(
     downloader: ImageDownloader,
     markdown_dir: Path,
     post_url: str = "",
+    attachments_by_id: dict[str, Attachment] | None = None,
 ) -> str:
+    content_html = expand_wordpress_galleries(
+        content_html,
+        attachments_by_id or {},
+    )
+    content_html = strip_wordpress_caption_shortcodes(content_html)
     soup = BeautifulSoup(content_html, "html.parser")
 
     # Remove common unwanted elements.
@@ -314,6 +533,28 @@ def clean_and_localise_html(
         ".sd-sharing-enabled"
     ):
         element.decompose()
+
+    # Blogger imports commonly represent an image caption as a two-row table.
+    # html2text renders the table border as "---" directly below the image,
+    # which Markdown readers can mistake for a Setext heading underline.
+    for table in soup.select("table.tr-caption-container"):
+        replacement = soup.new_tag("div")
+        image = table.find("img")
+        caption = table.select_one(".tr-caption")
+
+        if image is not None:
+            visual = image.parent if image.parent.name == "a" else image
+            replacement.append(visual.extract())
+
+        if caption is not None:
+            caption_text = caption.get_text(" ", strip=True)
+
+            if caption_text:
+                caption_paragraph = soup.new_tag("p")
+                caption_paragraph.string = caption_text
+                replacement.append(caption_paragraph)
+
+        table.replace_with(replacement)
 
     # Localise images.
     for img in soup.find_all("img"):
@@ -386,6 +627,285 @@ def yaml_escape(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def select_automatic_cover(blog: BlogExport) -> str | None:
+    cover_pattern = re.compile(r"(?:cover|blog[ _-]?header|header)", re.I)
+    candidates = [
+        attachment
+        for attachment in blog.attachments
+        if cover_pattern.search(
+            f"{attachment.title} {safe_filename_from_url(attachment.url)}"
+        )
+    ]
+
+    if candidates:
+        def candidate_rank(attachment: Attachment) -> tuple[int, datetime]:
+            stem = Path(safe_filename_from_url(attachment.url)).stem
+            normalized = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+
+            if re.fullmatch(r"blog-?header\d*", normalized):
+                relevance = 3
+            elif "cover" in normalized:
+                relevance = 2
+            else:
+                relevance = 1
+
+            return relevance, attachment.date or datetime.min
+
+        candidates.sort(
+            key=candidate_rank,
+            reverse=True,
+        )
+        return candidates[0].url
+
+    return blog.channel_image
+
+
+def load_cover_source(source: str) -> Image.Image:
+    if source.startswith(("http://", "https://")):
+        try:
+            response = requests.get(source, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Couldn't download cover image {source}: {exc}"
+            ) from exc
+
+        content_type = response.headers.get("Content-Type", "")
+
+        if image_extension(content_type) is None:
+            raise RuntimeError(
+                f"Cover URL did not return an image: {source} "
+                f"(Content-Type: {content_type or 'missing'})"
+            )
+
+        image_data = io.BytesIO(response.content)
+    else:
+        path = Path(source).expanduser()
+
+        if not path.is_file():
+            raise RuntimeError(f"Cover image does not exist: {path}")
+
+        image_data = path
+
+    try:
+        with Image.open(image_data) as image:
+            return ImageOps.exif_transpose(image).convert("RGB")
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Couldn't read cover image {source}: {exc}") from exc
+
+
+def cover_font(size: int, bold: bool = False):
+    names = (
+        ["DejaVuSerif-Bold.ttf", "DejaVuSans-Bold.ttf"]
+        if bold
+        else ["DejaVuSerif.ttf", "DejaVuSans.ttf"]
+    )
+    directories = [
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/System/Library/Fonts/Supplemental"),
+        Path("/Library/Fonts"),
+    ]
+
+    for directory in directories:
+        for name in names:
+            path = directory / name
+
+            if path.exists():
+                return ImageFont.truetype(str(path), size=size)
+
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size=size)
+        except OSError:
+            pass
+
+    return ImageFont.load_default()
+
+
+def wrap_cover_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    max_width: int,
+) -> str:
+    lines: list[str] = []
+
+    for paragraph in text.splitlines() or [""]:
+        words = paragraph.split()
+        line = ""
+
+        for word in words:
+            candidate = f"{line} {word}".strip()
+            width = draw.textbbox((0, 0), candidate, font=font)[2]
+
+            if line and width > max_width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def render_cover(
+    size: tuple[int, int],
+    source_image: Image.Image | None,
+    title: str,
+    subtitle: str | None,
+    author: str | None,
+    date_range: str,
+) -> Image.Image:
+    width, height = size
+    margin = int(width * 0.09)
+    canvas = Image.new("RGB", size, (24, 32, 45))
+    draw = ImageDraw.Draw(canvas)
+    title_font = cover_font(max(48, width // 14), bold=True)
+    subtitle_font = cover_font(max(28, width // 32))
+    detail_font = cover_font(max(26, width // 38))
+
+    title_text = wrap_cover_text(
+        draw,
+        title,
+        title_font,
+        width - (margin * 2),
+    )
+    title_box = draw.multiline_textbbox(
+        (0, 0),
+        title_text,
+        font=title_font,
+        spacing=18,
+    )
+    title_height = title_box[3] - title_box[1]
+    title_y = margin
+    draw.multiline_text(
+        (margin, title_y),
+        title_text,
+        font=title_font,
+        fill=(248, 247, 242),
+        spacing=18,
+    )
+
+    content_top = title_y + title_height + int(height * 0.055)
+    footer_height = int(height * 0.24)
+
+    if source_image is not None:
+        image_height = max(1, height - content_top - footer_height)
+        fitted = ImageOps.contain(
+            source_image,
+            (width, image_height),
+            method=Image.Resampling.LANCZOS,
+        )
+        image_x = (width - fitted.width) // 2
+        image_y = content_top + ((image_height - fitted.height) // 2)
+        canvas.paste(fitted, (image_x, image_y))
+
+    footer_y = height - footer_height + int(height * 0.045)
+
+    if subtitle:
+        subtitle_text = wrap_cover_text(
+            draw,
+            subtitle,
+            subtitle_font,
+            width - (margin * 2),
+        )
+        draw.multiline_text(
+            (margin, footer_y),
+            subtitle_text,
+            font=subtitle_font,
+            fill=(213, 220, 229),
+            spacing=10,
+        )
+
+    detail = " · ".join(part for part in (author, date_range) if part)
+    detail_box = draw.textbbox((0, 0), detail, font=detail_font)
+    draw.text(
+        (margin, height - margin - (detail_box[3] - detail_box[1])),
+        detail,
+        font=detail_font,
+        fill=(166, 181, 198),
+    )
+
+    return canvas
+
+
+def make_cover_assets(
+    output_dir: Path,
+    blog: BlogExport,
+    explicit_source: str | None,
+    title: str,
+    subtitle: str | None,
+    author: str | None,
+) -> tuple[Path, Path, Path]:
+    source = explicit_source or select_automatic_cover(blog)
+    source_image = None
+
+    if source:
+        try:
+            source_image = load_cover_source(source)
+            source_kind = "specified" if explicit_source else "WXR"
+            print(f"Using {source_kind} cover image: {source}")
+        except RuntimeError as exc:
+            if explicit_source:
+                raise
+
+            print(f"Warning: {exc}", file=sys.stderr)
+            print("Falling back to a typography-only cover.")
+    else:
+        print("No cover image found; generating a typography-only cover.")
+
+    date_range = f"Blog archive · {blog.posts[0].date.year}–{blog.posts[-1].date.year}"
+    epub_cover = output_dir / "cover.jpg"
+    pdf_cover = output_dir / "cover-pdf.jpg"
+    thumbnail = output_dir / "cover-thumbnail.jpg"
+
+    render_cover(
+        (1600, 2560),
+        source_image,
+        title,
+        subtitle,
+        author,
+        date_range,
+    ).save(epub_cover, quality=92, optimize=True)
+    render_cover(
+        (1600, 2263),
+        source_image,
+        title,
+        subtitle,
+        author,
+        date_range,
+    ).save(pdf_cover, quality=92, optimize=True)
+
+    with Image.open(epub_cover) as cover:
+        cover.resize((400, 640), Image.Resampling.LANCZOS).save(
+            thumbnail,
+            quality=88,
+            optimize=True,
+        )
+
+    return epub_cover, pdf_cover, thumbnail
+
+
+def make_pdf_cover_header(output_dir: Path, pdf_cover: Path) -> Path:
+    header_path = output_dir / "pdf-cover.tex"
+    header_path.write_text(
+        "\\usepackage{graphicx}\n"
+        "\\renewcommand{\\maketitle}{%\n"
+        "  \\begin{titlepage}%\n"
+        "  \\newgeometry{margin=0pt}%\n"
+        "  \\thispagestyle{empty}%\n"
+        f"  \\noindent\\includegraphics[width=\\paperwidth,height=\\paperheight]"
+        f"{{{pdf_cover.name}}}%\n"
+        "  \\restoregeometry%\n"
+        "  \\end{titlepage}%\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    return header_path
+
+
 def make_post_markdown(post: Post, body: str) -> str:
     lines = [
         f"# {post.title}",
@@ -424,6 +944,7 @@ def make_post_markdown(post: Post, body: str) -> str:
 def write_posts(
     posts: list[Post],
     output_dir: Path,
+    attachments: list[Attachment] | None = None,
 ) -> tuple[list[Path], Path]:
     posts_dir = output_dir / "posts"
     images_dir = output_dir / "images"
@@ -432,6 +953,11 @@ def write_posts(
     images_dir.mkdir(parents=True, exist_ok=True)
 
     downloader = ImageDownloader(images_dir)
+    attachments_by_id = {
+        attachment.post_id: attachment
+        for attachment in (attachments or [])
+        if attachment.post_id
+    }
 
     written_files: list[Path] = []
 
@@ -448,6 +974,7 @@ def write_posts(
                 downloader,
                 posts_dir,
                 post.link,
+                attachments_by_id,
             )
 
             markdown_body = html_to_markdown(cleaned_html)
@@ -574,6 +1101,7 @@ def require_pandoc():
 def build_epub(
     combined_md: Path,
     metadata: Path,
+    cover: Path,
     output_dir: Path,
     filename: str,
 ):
@@ -589,6 +1117,7 @@ def build_epub(
         "--toc",
         "--toc-depth=2",
         "--resource-path=.",
+        f"--epub-cover-image={cover.name}",
         "-o",
         epub_path.name,
     ]
@@ -607,6 +1136,7 @@ def build_epub(
 def build_pdf(
     combined_md: Path,
     metadata: Path,
+    cover_header: Path,
     output_dir: Path,
     filename: str,
 ):
@@ -623,6 +1153,7 @@ def build_pdf(
         "--toc-depth=2",
         "--resource-path=.",
         "--pdf-engine=xelatex",
+        f"--include-in-header={cover_header.name}",
         "-V",
         "geometry:margin=25mm",
         "-V",
@@ -668,20 +1199,30 @@ def main():
 
     parser.add_argument(
         "--title",
-        default="WordPress Blog Archive",
-        help="Book title",
+        default=None,
+        help="Book title (defaults to the WXR site title)",
     )
 
     parser.add_argument(
         "--subtitle",
         default=None,
-        help="Optional subtitle",
+        help="Subtitle (defaults to the WXR site description)",
     )
 
     parser.add_argument(
         "--author",
         default=None,
-        help="Book author",
+        help="Book author (defaults to the first WXR author)",
+    )
+
+    parser.add_argument(
+        "--cover-image",
+        default=None,
+        metavar="PATH_OR_URL",
+        help=(
+            "Cover source image. If omitted, use a header/cover attachment, "
+            "then the WXR channel icon, then typography only"
+        ),
     )
 
     parser.add_argument(
@@ -714,7 +1255,8 @@ def main():
 
     print(f"Reading {args.xml}...")
 
-    posts = parse_wordpress_export(args.xml)
+    blog = parse_wordpress_export(args.xml)
+    posts = blog.posts
 
     print(f"Found {len(posts)} published posts.")
 
@@ -723,32 +1265,53 @@ def main():
             "No published WordPress posts were found."
         )
 
+    title = args.title or blog.title
+    subtitle = args.subtitle if args.subtitle is not None else blog.description
+    author = args.author if args.author is not None else blog.author
+
+    print(f"Book title: {title}")
+
+    epub_cover, pdf_cover, thumbnail = make_cover_assets(
+        args.output,
+        blog,
+        args.cover_image,
+        title,
+        subtitle,
+        author,
+    )
+    print(f"Created cover: {epub_cover}")
+    print(f"Created thumbnail: {thumbnail}")
+
     _, combined_md = write_posts(
         posts,
         args.output,
+        blog.attachments,
     )
 
     metadata = make_metadata(
         args.output,
-        args.title,
-        args.author,
-        args.subtitle,
+        title,
+        author,
+        subtitle,
     )
 
-    safe_book_name = slugify(args.title)
+    safe_book_name = slugify(title)
 
     if args.epub:
         build_epub(
             combined_md,
             metadata,
+            epub_cover,
             args.output,
             f"{safe_book_name}.epub",
         )
 
     if args.pdf:
+        cover_header = make_pdf_cover_header(args.output, pdf_cover)
         build_pdf(
             combined_md,
             metadata,
+            cover_header,
             args.output,
             f"{safe_book_name}.pdf",
         )
