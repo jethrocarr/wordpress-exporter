@@ -137,3 +137,7 @@ Output book filenames are derived from the book title.
 - Posts are ordered chronologically and grouped by year in the combined book.
 - Images referenced by posts are downloaded into the output directory.
 - Original post URLs, categories, and tags are retained when available.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
