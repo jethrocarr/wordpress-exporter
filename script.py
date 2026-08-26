@@ -17,8 +17,7 @@ Example:
         --title "My Blog" \
         --author "Jethro Carr" \
         --output ./blog-book \
-        --epub \
-        --pdf
+        --both
 
 Requirements:
 
@@ -38,6 +37,7 @@ import argparse
 import html
 import io
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
@@ -403,14 +403,45 @@ class ImageDownloader:
 
         self.cache: dict[str, Path] = {}
 
+    @staticmethod
+    def is_valid_image(path: Path) -> bool:
+        try:
+            is_nonempty_file = path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+        if not is_nonempty_file:
+            return False
+
+        # Pillow cannot decode SVG, but an XML declaration or <svg> root is
+        # enough to reject empty/HTML responses masquerading as SVG images.
+        if path.suffix.lower() == ".svg":
+            try:
+                prefix = path.read_bytes()[:4096].lstrip().lower()
+            except OSError:
+                return False
+            return prefix.startswith(b"<?xml") or b"<svg" in prefix
+
+        try:
+            with Image.open(path) as image:
+                image.load()
+        except (OSError, SyntaxError, ValueError):
+            return False
+
+        return True
+
     def make_latex_compatible(self, path: Path) -> Path | None:
         if path.suffix.lower() not in LATEX_INCOMPATIBLE_IMAGE_EXTENSIONS:
             return path
 
         converted_path = path.with_suffix(".png")
 
-        if converted_path.exists():
+        if self.is_valid_image(converted_path):
             return converted_path
+
+        temporary_path = converted_path.with_name(
+            f".{converted_path.name}.convert"
+        )
 
         try:
             with Image.open(path) as image:
@@ -423,13 +454,20 @@ class ImageDownloader:
                     or "transparency" in image.info
                 )
                 image = image.convert("RGBA" if has_transparency else "RGB")
-                image.save(converted_path, format="PNG", optimize=True)
+                image.save(temporary_path, format="PNG", optimize=True)
+
+            if not self.is_valid_image(temporary_path):
+                raise OSError("converted output is not a valid image")
+
+            os.replace(temporary_path, converted_path)
         except (OSError, ValueError) as exc:
             print(
                 f"Warning: couldn't convert image {path} to PNG: {exc}",
                 file=sys.stderr,
             )
             return None
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
         print(f"Converted for PDF: {path.name} -> {converted_path.name}")
         return converted_path
@@ -444,6 +482,14 @@ class ImageDownloader:
             existing_path = self.image_dir / f"{stem}{extension}"
 
             if existing_path.exists():
+                if not self.is_valid_image(existing_path):
+                    print(
+                        f"Warning: replacing invalid cached image "
+                        f"{existing_path}",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 compatible_path = self.make_latex_compatible(existing_path)
 
                 if compatible_path is None:
@@ -483,24 +529,33 @@ class ImageDownloader:
 
             path = self.image_dir / f"{stem}{extension}"
 
-            if path.exists():
+            if path.exists() and self.is_valid_image(path):
                 self.cache[url] = path
                 print(f"Already downloaded: {url}")
                 return path
 
-            with open(path, "wb") as f:
+            temporary_path = path.with_name(f".{path.name}.download")
+
+            with open(temporary_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 128):
                     if chunk:
                         f.write(chunk)
 
-        except OSError as exc:
+            if not self.is_valid_image(temporary_path):
+                raise OSError("downloaded response is empty or not a valid image")
+
+            os.replace(temporary_path, path)
+
+        except (OSError, requests.RequestException) as exc:
             print(
-                f"Warning: couldn't save {url}: {exc}",
+                f"Warning: couldn't download or save {url}: {exc}",
                 file=sys.stderr,
             )
             return None
         finally:
             response.close()
+            if "temporary_path" in locals():
+                temporary_path.unlink(missing_ok=True)
 
         compatible_path = self.make_latex_compatible(path)
 
@@ -1239,6 +1294,12 @@ def main():
         help="Generate PDF",
     )
 
+    parser.add_argument(
+        "--both",
+        action="store_true",
+        help="Generate EPUB followed by PDF",
+    )
+
     args = parser.parse_args()
 
     if not args.xml.exists():
@@ -1246,7 +1307,11 @@ def main():
             f"File does not exist: {args.xml}"
         )
 
-    # Default to EPUB if neither was specified.
+    if args.both:
+        args.epub = True
+        args.pdf = True
+
+    # Default to EPUB if no output format was specified.
     if not args.epub and not args.pdf:
         args.epub = True
 

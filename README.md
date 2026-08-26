@@ -48,12 +48,12 @@ Run the following command inside the container:
 ```sh
 wordpress-export MyBlog.WordPress.xml \
   --output my-blog-book \
-  --epub \
-  --pdf
+  --both
 ```
 
-Replace `MyBlog.WordPress.xml` with the name of your downloaded export. If you
-omit both `--epub` and `--pdf`, the converter creates an EPUB by default.
+Replace `MyBlog.WordPress.xml` with the name of your downloaded export. The
+`--both` option creates the EPUB first, followed by the PDF. If you omit all
+output-format options, the converter creates an EPUB by default.
 
 ## Customise the book
 
@@ -66,8 +66,7 @@ wordpress-export MyBlog.WordPress.xml \
   --subtitle "Posts from 2007–2025" \
   --author "Example Author" \
   --output my-blog-book \
-  --epub \
-  --pdf
+  --both
 ```
 
 ### Command options
@@ -82,6 +81,7 @@ wordpress-export MyBlog.WordPress.xml \
 | `--cover-image PATH_OR_URL` | Local image or HTTP(S) URL to use for the cover |
 | `--epub` | Generate an EPUB |
 | `--pdf` | Generate a PDF |
+| `--both` | Generate an EPUB followed by a PDF |
 
 You can also display the built-in command help:
 
