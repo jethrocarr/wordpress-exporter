@@ -338,6 +338,18 @@ def clean_and_localise_html(
                 img["src"] = relative.as_posix()
             except ValueError:
                 img["src"] = local_path.as_posix()
+        else:
+            # Do not leave a rejected or unreachable remote image for Pandoc
+            # to download itself. Its response may be HTML despite appearing
+            # in an <img> element, which PDF engines cannot render.
+            alt_text = img.get("alt")
+
+            if alt_text:
+                img.replace_with(alt_text)
+            else:
+                img.decompose()
+
+            continue
 
         # Strip WordPress responsive image URLs because they would
         # otherwise continue pointing at the live site.
@@ -499,7 +511,9 @@ def write_posts(
                     f"*Original URL: {post.link}*\n\n"
                 )
 
-            combined.write("\\newpage\n\n")
+            # Keep generated LaTeX explicit so Pandoc can safely disable
+            # implicit raw TeX in article text (for example Windows paths).
+            combined.write("```{=latex}\n\\newpage\n```\n\n")
 
             print(
                 f"[{index}/{len(posts)}] {post.date.date()} "
@@ -571,6 +585,7 @@ def build_epub(
         "pandoc",
         metadata.name,
         combined_md.name,
+        "--from=markdown-raw_tex",
         "--toc",
         "--toc-depth=2",
         "--resource-path=.",
@@ -603,13 +618,21 @@ def build_pdf(
         "pandoc",
         metadata.name,
         combined_md.name,
+        "--from=markdown-raw_tex",
         "--toc",
         "--toc-depth=2",
         "--resource-path=.",
+        "--pdf-engine=xelatex",
         "-V",
         "geometry:margin=25mm",
         "-V",
         "fontsize=11pt",
+        "-V",
+        "mainfont=DejaVu Serif",
+        "-V",
+        "sansfont=DejaVu Sans",
+        "-V",
+        "monofont=DejaVu Sans Mono",
         "-o",
         pdf_path.name,
     ]
