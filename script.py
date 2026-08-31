@@ -1170,7 +1170,12 @@ def build_epub(
         "pandoc",
         metadata.name,
         combined_md.name,
-        "--from=markdown-raw_tex",
+        # Post text can contain prose such as "<Ends>" or
+        # "<insert stream of profanities>". Pandoc's raw_html extension
+        # otherwise treats these as literal XML tags and emits an invalid
+        # EPUB. HTML has already been converted to Markdown at this point, so
+        # disabling raw HTML safely preserves angle-bracketed prose as text.
+        "--from=markdown-raw_html-raw_tex",
         "--toc",
         "--toc-depth=2",
         "--resource-path=.",
@@ -1205,7 +1210,7 @@ def build_pdf(
         "pandoc",
         metadata.name,
         combined_md.name,
-        "--from=markdown-raw_tex",
+        "--from=markdown-raw_html-raw_tex",
         "--toc",
         "--toc-depth=2",
         "--resource-path=.",
